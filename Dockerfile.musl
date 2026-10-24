@@ -1,0 +1,11 @@
+FROM rust:alpine AS build
+RUN apk add --no-cache build-base musl-dev
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo build --release --locked --target x86_64-unknown-linux-musl
+FROM scratch
+COPY --from=build /build/target/x86_64-unknown-linux-musl/release/html2pdf /html2pdf
+WORKDIR /work
+ENTRYPOINT ["/html2pdf"]
+CMD ["--help"]

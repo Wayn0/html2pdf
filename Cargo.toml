@@ -1,0 +1,23 @@
+[package]
+name = "html2pdf"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A browser-free HTML report to PDF command-line tool"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+base64 = "0.22.1"
+clap = { version = "4.6.7", features = ["derive"] }
+printpdf = { version = "0.12.8", default-features = false, features = ["html", "png", "jpeg"] }
+scraper = "0.29.0"
+tempfile = "3.27.0"
+ureq = { version = "3.5.0", default-features = false, features = ["rustls"] }
+
+[dev-dependencies]
+lopdf = { version = "0.44.0", default-features = false }
+
+[profile.release]
+strip = true
+lto = "thin"

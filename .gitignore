@@ -1,0 +1,33 @@
+# Rust build output (keep Cargo.lock: this is an application).
+/target/
+
+# Locally packaged/extracted release binaries.
+/dist/
+/html2pdf
+/html2pdf-musl
+
+# Generated report output; HTML and image regression fixtures remain tracked.
+*.pdf
+
+# Python version/release tooling.
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local environment and editor/OS files.
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Local agent state and cloud credentials.
+/.agents/
+/.codex/
+/.aws/
+*.log

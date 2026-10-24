@@ -1,0 +1,114 @@
+name: Release binaries
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify tag matches the application version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python3 scripts/version.py check-tag "$RELEASE_TAG"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: python3 -m unittest discover -s scripts -p 'test_*.py'
+
+  build:
+    needs: check
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            dockerfile: Dockerfile
+            binary: /usr/local/bin/html2pdf
+          - target: x86_64-unknown-linux-musl
+            dockerfile: Dockerfile.musl
+            binary: /html2pdf
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build runtime image
+        env:
+          DOCKERFILE: ${{ matrix.dockerfile }}
+        run: docker build -f "$DOCKERFILE" -t html2pdf:release .
+      - name: Smoke test in its runtime image without networking
+        run: |
+          mkdir -p "$RUNNER_TEMP/smoke"
+          docker run --rm --network none \
+            --user "$(id -u):$(id -g)" \
+            -v "$PWD:/work:ro" -v "$RUNNER_TEMP/smoke:/out" \
+            html2pdf:release tests/fixtures/elements.html /out/report.pdf --offline
+          test -s "$RUNNER_TEMP/smoke/report.pdf"
+      - name: Extract, verify and package binary
+        env:
+          TARGET: ${{ matrix.target }}
+          BINARY_PATH: ${{ matrix.binary }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          package="html2pdf-${RELEASE_TAG}-${TARGET}"
+          mkdir -p "dist/$package"
+          container=$(docker create html2pdf:release --version)
+          trap 'docker rm "$container" >/dev/null' EXIT
+          docker cp "$container:$BINARY_PATH" "dist/$package/html2pdf"
+          chmod +x "dist/$package/html2pdf"
+          expected="html2pdf ${RELEASE_TAG#v}"
+          test "$("dist/$package/html2pdf" --version)" = "$expected"
+          if [[ "$TARGET" == *musl ]]; then
+            if readelf -d "dist/$package/html2pdf" | grep -q '(NEEDED)'; then
+              echo 'musl binary unexpectedly links shared libraries' >&2
+              exit 1
+            fi
+          fi
+          cp README.md LICENSE "dist/$package/"
+          tar -C dist -czf "dist/$package.tar.gz" "$package"
+          cd dist
+          sha256sum "$package.tar.gz" > "$package.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cd dist
+          cat ./*.sha256 > SHA256SUMS
+          sha256sum --check SHA256SUMS
+          gh release create "$RELEASE_TAG" ./*.tar.gz SHA256SUMS \
+            --verify-tag --title "html2pdf $RELEASE_TAG" --generate-notes
