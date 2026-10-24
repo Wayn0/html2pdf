@@ -224,8 +224,8 @@ counts in large tables, page breaks, text wrapping, metadata, local/data/HTTP
 images (including actual image draw operations), stylesheet color operators,
 HTTP errors/timeouts, offline mode, input errors, clean stdout and safe file
 replacement. HTTP tests serve fixtures from ephemeral localhost ports and need
-local networking; they do not contact public servers. GitHub Actions runs the
-suite, a release build and a Docker smoke conversion.
+local networking; they do not contact public servers. GitHub Actions runs checks on pull requests. Version tags run the checks,
+release builds and Docker smoke conversions.
 
 For a manual check, generate the [sample report](examples/report.html) and the
 [element fixture](tests/fixtures/elements.html). Optional Poppler tools can help:
@@ -243,7 +243,9 @@ path to improving rendering without adding a heavyweight browser runtime.
 ## Publishing a release (GitHub Actions)
 
 GitHub Actions workflows live in `.github/workflows/`, similar to GitLab CI jobs.
-Branch pushes and pull requests run CI. Pushing a stable version tag such as
+Pull requests run formatting, lint and test checks (which compile test binaries).
+Branch pushes, including pushes to `main`, do not trigger a workflow. Release
+binaries and Docker images are built only when pushing a stable version tag such as
 `v0.1.1` runs the release workflow: validate the version, run tests, build GNU and
 musl binaries, smoke-test both container runtimes, package them, and publish a
 GitHub Release with the two archives and checksums. Tests and both builds must
@@ -272,7 +274,7 @@ git push origin v0.1.1
 
 The helper updates both Cargo files and refuses invalid versions or downgrades.
 A tag must exactly match the Cargo version; mismatches stop the release. Changing
-`Cargo.toml` alone runs normal CI when pushed; the tag is the explicit release
+`Cargo.toml` alone does not trigger a release; the tag is the explicit release
 trigger. Stable `X.Y.Z` versions are supported initially, without prerelease tags.
 Do not move published tags; release a new version instead.
 

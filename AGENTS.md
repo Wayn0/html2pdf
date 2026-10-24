@@ -33,7 +33,8 @@ docker build -f Dockerfile.musl -t html2pdf:musl .
 
 HTTP integration tests bind to ephemeral localhost ports and serve local fixtures;
 they do not depend on public internet services. Run them with local networking
-available. CI runs the same suite and Docker smoke conversions for GNU and static musl builds.
+available. Pull requests run the test suite. Version tags run release builds and Docker
+smoke conversions for GNU and static musl. Branch pushes do not trigger CI.
 
 ## Changes and regression coverage
 
