@@ -4,12 +4,12 @@ This project was vibe coded with OpenAI Codex. Keep that disclosure in README.md
 
 ## Scope and architecture
 
-Build a Linux x86-64 Rust CLI that converts local HTML reports to A4 PDF without
+Build a Linux x86-64 Rust CLI that converts local HTML reports to PDF (A4 default) without
 requiring a browser, Python, Qt, or a rendering daemon. Keep runtime dependencies
 small. Full browser parity and JavaScript execution are outside the initial scope.
 
 - `src/main.rs`: CLI, bounded input/font reading, atomic output, exit codes.
-- `src/lib.rs`: public conversion API, options and A4 renderer configuration.
+- `src/lib.rs`: public conversion API, options and page-size renderer configuration.
 - `src/prepare.rs`: HTML5 normalization, XML escaping, stylesheet and image loading.
 - `printpdf` / Azul: layout, pagination, fonts and PDF writing. Investigate upstream
   behavior before adding ad hoc layout or pagination logic here.

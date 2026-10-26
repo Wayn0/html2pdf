@@ -8,8 +8,32 @@ pub type Result<T> = std::result::Result<T, String>;
 pub const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_ASSET_BYTES: usize = 20 * 1024 * 1024;
 
+/// Portrait page sizes accepted by `--page-size` (names match wkhtmltopdf).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum PageSize {
+    A3,
+    #[default]
+    A4,
+    A5,
+    Letter,
+    Legal,
+}
+impl PageSize {
+    /// Width and height in millimetres.
+    pub fn dimensions_mm(self) -> (f32, f32) {
+        match self {
+            Self::A3 => (297.0, 420.0),
+            Self::A4 => (210.0, 297.0),
+            Self::A5 => (148.0, 210.0),
+            Self::Letter => (215.9, 279.4),
+            Self::Legal => (215.9, 355.6),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Options {
+    pub page_size: PageSize,
     pub margin_mm: f32,
     pub offline: bool,
     pub asset_timeout: Duration,
@@ -18,6 +42,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
+            page_size: PageSize::A4,
             margin_mm: 12.0,
             offline: false,
             asset_timeout: Duration::from_secs(15),
@@ -44,6 +69,13 @@ pub fn convert(html: &str, base_dir: &Path, options: &Options) -> Result<Convers
     if !options.margin_mm.is_finite() || !(0.0..=90.0).contains(&options.margin_mm) {
         return Err("margin must be a finite number between 0 and 90 mm".into());
     }
+    let (page_width, page_height) = options.page_size.dimensions_mm();
+    if 2.0 * options.margin_mm >= page_width.min(page_height) {
+        return Err(format!(
+            "margin of {} mm leaves no printable area on a {:?} page",
+            options.margin_mm, options.page_size
+        ));
+    }
     if options.asset_timeout.is_zero() {
         return Err("asset timeout must be greater than zero".into());
     }
@@ -59,8 +91,8 @@ pub fn convert(html: &str, base_dir: &Path, options: &Options) -> Result<Convers
         &prepared.images,
         &fonts,
         &GeneratePdfOptions {
-            page_width: Some(210.0),
-            page_height: Some(297.0),
+            page_width: Some(page_width),
+            page_height: Some(page_height),
             margin_top: Some(options.margin_mm),
             margin_bottom: Some(options.margin_mm),
             margin_left: Some(options.margin_mm),

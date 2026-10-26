@@ -148,6 +148,7 @@ fn invalid_arguments() {
         vec!["-", "-", "--asset-timeout", "0"],
         vec!["-", "-", "--font", "missing_equals"],
         vec!["-", "-", "--unknown"],
+        vec!["-", "-", "--page-size", "B5"],
     ] {
         let mut c = cmd()
             .args(args)
@@ -209,4 +210,27 @@ fn utf8_bom_is_accepted() {
     let path = input(&dir);
     std::fs::write(&path, "\u{feff}<p>Report</p>").unwrap();
     assert!(cmd().arg(path).arg("-").output().unwrap().status.success());
+}
+#[test]
+fn page_size_accepts_wkhtmltopdf_style_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = input(&dir);
+    for (size, width) in [("A4", 595.28), ("Letter", 612.0), ("legal", 612.0)] {
+        let o = cmd()
+            .arg(&path)
+            .arg("-")
+            .args(["--quiet", "--page-size", size])
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{size}: {:?}", o);
+        let pdf = lopdf::Document::load_mem(&o.stdout).unwrap();
+        let page = pdf.get_pages().values().next().copied().unwrap();
+        let bbox = pdf.get_object(page).unwrap().as_dict().unwrap();
+        let w = match &bbox.get(b"MediaBox").unwrap().as_array().unwrap()[2] {
+            lopdf::Object::Real(n) => *n,
+            lopdf::Object::Integer(n) => *n as f32,
+            _ => panic!("invalid page dimension"),
+        };
+        assert!((w - width).abs() < 0.2, "{size}: {w}");
+    }
 }

@@ -1,6 +1,6 @@
 # html2pdf
 
-A small Rust command-line tool that converts local HTML reports into A4 PDFs,
+A small Rust command-line tool that converts local HTML reports into PDFs (A4 by default),
 ready to attach to email. It embeds a renderer; **no Chrome, Qt, Python, or
 wkhtmltopdf installation is required**. Initial target: Linux x86-64.
 
@@ -52,6 +52,9 @@ html2pdf report.html - > report.pdf
 # Prevent network requests, adjust margins, replace an existing PDF.
 html2pdf report.html report.pdf --offline --margin 15 --force
 
+# Use US Letter instead of the default A4.
+html2pdf report.html report.pdf --page-size Letter
+
 # Supply a custom TTF/OTF font and use font-family: "Report Sans" in CSS.
 html2pdf report.html report.pdf --font 'Report Sans=/fonts/ReportSans.ttf'
 ```
@@ -64,7 +67,8 @@ for an existing PDF.
 | --- | --- |
 | `INPUT OUTPUT` | Local UTF-8 HTML and PDF paths; `-` means stdin/stdout |
 | `--base-dir DIR` | Asset directory; defaults to the input file's parent, or CWD for stdin |
-| `--margin MM` | All four page margins; default 12 mm, allowed range 0–90 |
+| `--page-size SIZE` | Portrait `A3`, `A4` (default), `A5`, `Letter` or `Legal`; case-insensitive |
+| `--margin MM` | All four page margins; default 12 mm, allowed range 0–90, must leave a printable area |
 | `--offline` | Reject HTTP(S) assets, while allowing local and data assets |
 | `--asset-timeout SECONDS` | Timeout per remote asset, default 15, range 1–300 |
 | `--font FAMILY=PATH` | Embed a TTF/OTF font; repeat for additional font files |
@@ -140,8 +144,9 @@ The CLI uses an HTML5 parser to recover normal HTML, including omitted closing
 tags, named entities and void elements, then normalizes it for the embedded
 `printpdf`/Azul renderer. No JavaScript executes.
 
-- A4 portrait pages, 210 × 297 mm. Other page sizes can be added through the options
-  layer later; HTML metadata does not override the CLI's page geometry.
+- Portrait pages, A4 (210 × 297 mm) by default. `--page-size` selects A3, A5, US
+  Letter or US Legal. Landscape orientation and custom dimensions are not supported
+  yet; HTML metadata does not override the CLI's page geometry.
 - Headings, paragraphs, semantic sections, lists, inline text, links, preformatted
   text, tables, cell spans, borders, padding and basic colors/styles.
 - Inline CSS, `<style>` blocks and UTF-8 `<link rel="stylesheet" href="…">` files.
@@ -184,7 +189,10 @@ engine rather than implementing a new browser.
   Interactive forms and canvas are unsupported. Rasterize charts into PNG/JPEG
   before conversion. Only PNG and JPEG decoders are enabled initially.
 - No browser-level fidelity promise, clickable-link guarantee, PDF/A, tagged PDF,
-  accessibility conformance or full wkhtmltopdf option compatibility.
+  accessibility conformance or full wkhtmltopdf option compatibility. Wrappers that
+  call a `wkhtmltopdf` executable can use this binary only with the options listed
+  above (for example `--quiet` and `--page-size`); other wkhtmltopdf flags are
+  rejected as usage errors.
 
 Use trusted report templates. The converter can read local assets and fetch
 remote assets referenced by a report; `--base-dir` is a resolution directory, not
@@ -219,7 +227,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ```
 
-Tests cover a broad HTML fixture, PDF parsing and A4 dimensions, content order and
+Tests cover a broad HTML fixture, PDF parsing and page dimensions for each size, content order and
 counts in large tables, page breaks, text wrapping, metadata, local/data/HTTP
 images (including actual image draw operations), stylesheet color operators,
 HTTP errors/timeouts, offline mode, input errors, clean stdout and safe file

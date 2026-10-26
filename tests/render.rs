@@ -381,3 +381,57 @@ fn script_content_is_not_rendered() {
     assert!(!text(&pdf).contains("SECRETJSMARK"));
     assert!(c.warnings.iter().any(|s| s.contains("JavaScript")));
 }
+#[test]
+fn page_size_option_sets_media_box() {
+    for (size, width, height) in [
+        (html2pdf::PageSize::A3, 841.89, 1190.55),
+        (html2pdf::PageSize::A4, 595.28, 841.89),
+        (html2pdf::PageSize::A5, 419.53, 595.28),
+        (html2pdf::PageSize::Letter, 612.0, 792.0),
+        (html2pdf::PageSize::Legal, 612.0, 1008.0),
+    ] {
+        let rows = (0..200)
+            .map(|i| format!("<tr><td>row-{i}</td></tr>"))
+            .collect::<String>();
+        let result = convert(
+            &format!("<table>{rows}</table><p>END-MARKER</p>"),
+            Path::new("."),
+            &Options {
+                page_size: size,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let pdf = lopdf::Document::load_mem(&result.bytes).unwrap();
+        assert!(result.pages > 1, "{size:?}");
+        for id in pdf.get_pages().values() {
+            let page = pdf.get_object(*id).unwrap().as_dict().unwrap();
+            let bbox = page.get(b"MediaBox").unwrap().as_array().unwrap();
+            let number = |v: &lopdf::Object| match v {
+                lopdf::Object::Real(n) => *n,
+                lopdf::Object::Integer(n) => *n as f32,
+                _ => panic!("invalid page dimension"),
+            };
+            assert!((number(&bbox[2]) - width).abs() < 0.2, "{size:?}");
+            assert!((number(&bbox[3]) - height).abs() < 0.2, "{size:?}");
+        }
+        let text = text(&pdf);
+        for i in 0..200 {
+            assert_eq!(text.matches(&format!("row-{i} ")).count(), 1, "{size:?}");
+        }
+        assert!(text.ends_with("END-MARKER"), "{size:?}");
+    }
+}
+#[test]
+fn margin_must_leave_printable_area() {
+    let result = convert(
+        "<p>x</p>",
+        Path::new("."),
+        &Options {
+            page_size: html2pdf::PageSize::A5,
+            margin_mm: 80.,
+            ..Options::default()
+        },
+    );
+    assert!(result.is_err());
+}

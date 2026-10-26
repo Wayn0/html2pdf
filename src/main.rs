@@ -1,5 +1,5 @@
 use clap::Parser;
-use html2pdf::{MAX_INPUT_BYTES, Options, Result};
+use html2pdf::{MAX_INPUT_BYTES, Options, PageSize, Result};
 use std::{
     collections::BTreeMap,
     fs::File,
@@ -12,7 +12,7 @@ use std::{
 #[derive(Parser)]
 #[command(
     version,
-    about = "Convert a local UTF-8 HTML report to an A4 PDF without a browser"
+    about = "Convert a local UTF-8 HTML report to a PDF without a browser"
 )]
 struct Cli {
     /// Local HTML file, or - for stdin
@@ -22,6 +22,9 @@ struct Cli {
     /// Resolve assets against this directory (default: input file's directory; CWD for stdin)
     #[arg(long)]
     base_dir: Option<PathBuf>,
+    /// Portrait page size (case-insensitive)
+    #[arg(long, value_enum, ignore_case = true, default_value_t = PageSize::A4)]
+    page_size: PageSize,
     /// Page margin on every side, in millimetres (0–90)
     #[arg(long, default_value_t = 12.0)]
     margin: f32,
@@ -114,6 +117,7 @@ fn run(cli: Cli) -> Result<()> {
         html,
         &base,
         &Options {
+            page_size: cli.page_size,
             margin_mm: cli.margin,
             offline: cli.offline,
             asset_timeout: Duration::from_secs(cli.asset_timeout),
@@ -148,8 +152,9 @@ fn run(cli: Cli) -> Result<()> {
     }
     if !cli.quiet {
         eprintln!(
-            "Rendered {} A4 page(s), {} bytes",
+            "Rendered {} {:?} page(s), {} bytes",
             result.pages,
+            cli.page_size,
             result.bytes.len()
         );
     }
