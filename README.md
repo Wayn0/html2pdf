@@ -49,8 +49,11 @@ cat report.html | html2pdf - report.pdf --base-dir ./assets
 # Pipe PDF bytes out; messages go to stderr.
 html2pdf report.html - > report.pdf
 
-# Prevent network requests, adjust margins, replace an existing PDF.
-html2pdf report.html report.pdf --offline --margin 15 --force
+# Prevent network requests and adjust margins (an existing PDF is replaced).
+html2pdf report.html report.pdf --offline --margin 15
+
+# wkhtmltopdf-style per-side margins; refuse to replace an existing PDF.
+html2pdf report.html report.pdf --margin-left 10mm --margin-right 1in --safe
 
 # Use US Letter instead of the default A4.
 html2pdf report.html report.pdf --page-size Letter
@@ -68,18 +71,20 @@ for an existing PDF.
 | `INPUT OUTPUT` | Local UTF-8 HTML and PDF paths; `-` means stdin/stdout |
 | `--base-dir DIR` | Asset directory; defaults to the input file's parent, or CWD for stdin |
 | `--page-size SIZE` | Portrait `A3`, `A4` (default), `A5`, `Letter` or `Legal`; case-insensitive |
-| `--margin MM` | All four page margins; default 12 mm, allowed range 0–90, must leave a printable area |
+| `--zoom FACTOR` | Scale content like wkhtmltopdf `--zoom`; default 1, range 0.1–10; margins and page size are unchanged |
+| `--margin LENGTH` | All four page margins; default 12 mm, allowed range 0–90 mm, must leave a printable area |
+| `--margin-top`, `--margin-right`, `--margin-bottom`, `--margin-left LENGTH` | Override one side (short forms `-T`, `-R`, `-B`, `-L`). Lengths take `mm` (default), `cm`, `in` or `pt` |
 | `--offline` | Reject HTTP(S) assets, while allowing local and data assets |
 | `--asset-timeout SECONDS` | Timeout per remote asset, default 15, range 1–300 |
 | `--font FAMILY=PATH` | Embed a TTF/OTF font; repeat for additional font files |
-| `--force` | Replace an existing output file after successful conversion |
+| `--safe` | Refuse to replace an existing output file. Without it, an existing file is replaced after successful conversion, like wkhtmltopdf (`--force` is accepted and ignored) |
 | `--quiet` | Suppress the success message; warnings/errors remain visible |
 
 A successful conversion exits 0. Conversion/I/O errors exit 1; invalid CLI usage
 exits 2. Missing or invalid assets fail the conversion rather than silently leaving
 holes in the report. Output files are written through a temporary file in the
 same directory and atomically installed. Failed conversion leaves an existing
-output intact, including with `--force`. Input and output cannot be the same file.
+output intact. Input and output cannot be the same file.
 
 ## Docker
 
@@ -191,7 +196,7 @@ engine rather than implementing a new browser.
 - No browser-level fidelity promise, clickable-link guarantee, PDF/A, tagged PDF,
   accessibility conformance or full wkhtmltopdf option compatibility. Wrappers that
   call a `wkhtmltopdf` executable can use this binary only with the options listed
-  above (for example `--quiet` and `--page-size`); other wkhtmltopdf flags are
+  above (for example `--quiet`, `--page-size` and `--zoom`); other wkhtmltopdf flags are
   rejected as usage errors.
 
 Use trusted report templates. The converter can read local assets and fetch

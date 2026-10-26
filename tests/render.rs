@@ -188,7 +188,7 @@ fn invalid_options_and_empty_input() {
                 "<p>x</p>",
                 Path::new("."),
                 &Options {
-                    margin_mm: m,
+                    margins: html2pdf::Margins::uniform(m),
                     ..Options::default()
                 }
             )
@@ -345,7 +345,7 @@ fn margin_options_keep_a4_page_size() {
             "<p>Margin test</p>",
             Path::new("."),
             &Options {
-                margin_mm: margin,
+                margins: html2pdf::Margins::uniform(margin),
                 ..Options::default()
             },
         )
@@ -423,13 +423,88 @@ fn page_size_option_sets_media_box() {
     }
 }
 #[test]
+fn zoom_scales_content_but_keeps_page_size() {
+    let rows = (0..200)
+        .map(|i| format!("<tr><td>row-{i}</td></tr>"))
+        .collect::<String>();
+    let html = format!("<table>{rows}</table><p>END-MARKER</p>");
+    let render = |zoom| {
+        convert(
+            &html,
+            Path::new("."),
+            &Options {
+                zoom,
+                ..Options::default()
+            },
+        )
+        .unwrap()
+    };
+    let normal = render(1.0);
+    let zoomed = render(2.0);
+    assert!(
+        zoomed.pages > normal.pages,
+        "{} vs {}",
+        zoomed.pages,
+        normal.pages
+    );
+    let pdf = lopdf::Document::load_mem(&zoomed.bytes).unwrap();
+    for id in pdf.get_pages().values() {
+        let page = pdf.get_object(*id).unwrap().as_dict().unwrap();
+        let bbox = page.get(b"MediaBox").unwrap().as_array().unwrap();
+        let number = |v: &lopdf::Object| match v {
+            lopdf::Object::Real(n) => *n,
+            lopdf::Object::Integer(n) => *n as f32,
+            _ => panic!("invalid page dimension"),
+        };
+        assert!((number(&bbox[2]) - 595.28).abs() < 0.2);
+        assert!((number(&bbox[3]) - 841.89).abs() < 0.2);
+        let ops = pdf.get_and_decode_page_content(*id).unwrap().operations;
+        let first = ops.iter().find(|op| op.operator == "cm").unwrap();
+        let matrix = first.operands.iter().map(number).collect::<Vec<_>>();
+        assert_eq!(matrix, [2.0, 0.0, 0.0, 2.0, 0.0, 0.0]);
+    }
+    let text = text(&pdf);
+    for i in 0..200 {
+        assert_eq!(text.matches(&format!("row-{i} ")).count(), 1);
+    }
+    assert!(text.ends_with("END-MARKER"));
+    for zoom in [0.0, f32::NAN, 11.0] {
+        assert!(
+            convert(
+                "<p>x</p>",
+                Path::new("."),
+                &Options {
+                    zoom,
+                    ..Options::default()
+                }
+            )
+            .is_err()
+        );
+    }
+}
+#[test]
 fn margin_must_leave_printable_area() {
     let result = convert(
         "<p>x</p>",
         Path::new("."),
         &Options {
             page_size: html2pdf::PageSize::A5,
-            margin_mm: 80.,
+            margins: html2pdf::Margins::uniform(80.),
+            ..Options::default()
+        },
+    );
+    assert!(result.is_err());
+    let lopsided = html2pdf::Margins {
+        left: 90.,
+        right: 90.,
+        ..html2pdf::Margins::uniform(10.)
+    };
+    let result = convert(
+        "<p>x</p>",
+        Path::new("."),
+        &Options {
+            page_size: html2pdf::PageSize::A5,
+            margins: lopsided,
             ..Options::default()
         },
     );

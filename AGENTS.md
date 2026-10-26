@@ -40,8 +40,10 @@ smoke conversions for GNU and static musl. Branch pushes do not trigger CI.
 
 Keep assets relative to the input directory unless `--base-dir` overrides it.
 Keep stdout exclusively PDF bytes when output is `-`; diagnostics go to stderr.
-Fail on missing/unreadable/invalid assets. Never silently replace an existing PDF
-without `--force`, or destroy the previous output when conversion fails.
+Fail on missing/unreadable/invalid assets. Like wkhtmltopdf, an existing PDF is
+replaced by default (atomically); `--safe` refuses to replace it. Never destroy the
+previous output when conversion fails. CLI flags that overlap wkhtmltopdf should
+accept its spelling and values, since wrappers invoke this binary as `wkhtmltopdf`.
 
 For a real report regression, add a small sanitized fixture with the failing HTML
 and a test that checks the relevant page, text, image draw operation, or geometry.

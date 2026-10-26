@@ -99,8 +99,9 @@ pub(crate) fn prepare(html: &str, base: &Path, options: &Options) -> Result<Prep
         out.warnings.push("CSS @media blocks have limited renderer support; use a print stylesheet with media=\"print\"".into());
     }
     if css.contains("@page") {
-        out.warnings
-            .push("CSS @page is unsupported; A4 and --margin control page geometry".into());
+        out.warnings.push(
+            "CSS @page is unsupported; --page-size and margin options control page geometry".into(),
+        );
     }
     let mut seen = BTreeSet::new();
     for element in parsed.select(&selector("img")) {

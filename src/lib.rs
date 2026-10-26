@@ -1,7 +1,9 @@
 //! Local HTML report conversion using an embedded renderer.
 mod prepare;
 
-use printpdf::{Base64OrRaw, GeneratePdfOptions, PdfDocument, PdfSaveOptions};
+use printpdf::{
+    Base64OrRaw, CurTransMat, GeneratePdfOptions, Mm, Op, PdfDocument, PdfSaveOptions, Rect,
+};
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -31,10 +33,31 @@ impl PageSize {
     }
 }
 
+/// Page margins in millimetres.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Margins {
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+    pub left: f32,
+}
+impl Margins {
+    pub fn uniform(mm: f32) -> Self {
+        Self {
+            top: mm,
+            right: mm,
+            bottom: mm,
+            left: mm,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Options {
     pub page_size: PageSize,
-    pub margin_mm: f32,
+    pub margins: Margins,
+    /// Content scale factor, like wkhtmltopdf `--zoom`; margins stay physical.
+    pub zoom: f32,
     pub offline: bool,
     pub asset_timeout: Duration,
     pub fonts: BTreeMap<String, Vec<u8>>,
@@ -43,7 +66,8 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             page_size: PageSize::A4,
-            margin_mm: 12.0,
+            margins: Margins::uniform(12.0),
+            zoom: 1.0,
             offline: false,
             asset_timeout: Duration::from_secs(15),
             fonts: BTreeMap::new(),
@@ -66,15 +90,22 @@ pub fn convert(html: &str, base_dir: &Path, options: &Options) -> Result<Convers
     if html.len() > MAX_INPUT_BYTES {
         return Err("input HTML exceeds the 32 MiB limit".into());
     }
-    if !options.margin_mm.is_finite() || !(0.0..=90.0).contains(&options.margin_mm) {
-        return Err("margin must be a finite number between 0 and 90 mm".into());
+    let m = options.margins;
+    if [m.top, m.right, m.bottom, m.left]
+        .iter()
+        .any(|v| !v.is_finite() || !(0.0..=90.0).contains(v))
+    {
+        return Err("margins must be finite numbers between 0 and 90 mm".into());
     }
     let (page_width, page_height) = options.page_size.dimensions_mm();
-    if 2.0 * options.margin_mm >= page_width.min(page_height) {
+    if m.left + m.right >= page_width || m.top + m.bottom >= page_height {
         return Err(format!(
-            "margin of {} mm leaves no printable area on a {:?} page",
-            options.margin_mm, options.page_size
+            "margins of {m:?} mm leave no printable area on a {:?} page",
+            options.page_size
         ));
+    }
+    if !options.zoom.is_finite() || !(0.1..=10.0).contains(&options.zoom) {
+        return Err("zoom must be a finite number between 0.1 and 10".into());
     }
     if options.asset_timeout.is_zero() {
         return Err("asset timeout must be greater than zero".into());
@@ -85,18 +116,20 @@ pub fn convert(html: &str, base_dir: &Path, options: &Options) -> Result<Convers
         .iter()
         .map(|(name, bytes)| (name.clone(), Base64OrRaw::Raw(bytes.clone())))
         .collect();
+    // Lay out on a page shrunk by the zoom factor, then scale each page back up.
+    let zoom = options.zoom;
     let mut warnings = Vec::new();
     let mut doc = PdfDocument::from_html(
         &prepared.xml,
         &prepared.images,
         &fonts,
         &GeneratePdfOptions {
-            page_width: Some(page_width),
-            page_height: Some(page_height),
-            margin_top: Some(options.margin_mm),
-            margin_bottom: Some(options.margin_mm),
-            margin_left: Some(options.margin_mm),
-            margin_right: Some(options.margin_mm),
+            page_width: Some(page_width / zoom),
+            page_height: Some(page_height / zoom),
+            margin_top: Some(m.top / zoom),
+            margin_bottom: Some(m.bottom / zoom),
+            margin_left: Some(m.left / zoom),
+            margin_right: Some(m.right / zoom),
             ..Default::default()
         },
         &mut warnings,
@@ -104,6 +137,24 @@ pub fn convert(html: &str, base_dir: &Path, options: &Options) -> Result<Convers
     .map_err(|e| format!("rendering failed: {e}"))?;
     if doc.pages.is_empty() {
         return Err(format!("renderer produced no pages: {warnings:?}"));
+    }
+    if zoom != 1.0 {
+        let page_box = Rect::from_wh(Mm(page_width).into_pt(), Mm(page_height).into_pt());
+        for page in &mut doc.pages {
+            page.media_box = page_box.clone();
+            page.trim_box = page_box.clone();
+            page.crop_box = page_box.clone();
+            page.ops.splice(
+                0..0,
+                [
+                    Op::SaveGraphicsState,
+                    Op::SetTransformationMatrix {
+                        matrix: CurTransMat::Scale(zoom, zoom),
+                    },
+                ],
+            );
+            page.ops.push(Op::RestoreGraphicsState);
+        }
     }
     if let Some(title) = prepared.title {
         doc.metadata.info.document_title = title;
