@@ -216,7 +216,7 @@ fn load(src: &str, base: &Path, options: &Options, agent: &ureq::Agent) -> Resul
             return Err(format!("remote asset blocked by --offline: {src}"));
         }
         agent
-            .get(src)
+            .get(&encode_url(src))
             .call()
             .map_err(|e| format!("fetching {src:?}: {e}"))?
             .body_mut()
@@ -243,6 +243,22 @@ fn load(src: &str, base: &Path, options: &Options, agent: &ureq::Agent) -> Resul
         return Err(format!("asset {src:?} exceeds 20 MiB limit"));
     }
     Ok(bytes)
+}
+
+// Percent-encode characters browsers tolerate in src attributes but HTTP URIs reject
+// (e.g. spaces in uploaded file names). Existing %XX escapes are kept; the fragment
+// is never sent to the server.
+fn encode_url(src: &str) -> String {
+    let src = src.split_once('#').map_or(src, |(url, _)| url);
+    let mut out = String::with_capacity(src.len());
+    for &b in src.as_bytes() {
+        if b <= b' ' || b >= 0x7f || b"\"<>\\^`{|}".contains(&b) {
+            out.push_str(&format!("%{b:02X}"));
+        } else {
+            out.push(b as char);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -283,6 +299,21 @@ mod tests {
         assert!(!p.xml.contains("script"));
         assert!(!p.xml.contains("onclick"));
         assert_eq!(p.warnings.len(), 1);
+    }
+    #[test]
+    fn url_encoding() {
+        assert_eq!(
+            encode_url("https://h/a/logo _70 .png"),
+            "https://h/a/logo%20_70%20.png"
+        );
+        assert_eq!(
+            encode_url("http://h/%20é?q=a b#x"),
+            "http://h/%20%C3%A9?q=a%20b"
+        );
+        assert_eq!(
+            encode_url("http://h/a.png?x=1&y=2"),
+            "http://h/a.png?x=1&y=2"
+        );
     }
     #[test]
     fn screen_styles_omitted() {

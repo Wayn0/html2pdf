@@ -23,7 +23,7 @@ fn has_painted_image(bytes: &[u8]) {
     }
     assert!(painted, "image embedded but not painted");
 }
-fn server(status: &str, body: Vec<u8>, delay: Duration) -> (String, thread::JoinHandle<()>) {
+fn server(status: &str, body: Vec<u8>, delay: Duration) -> (String, thread::JoinHandle<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/asset", listener.local_addr().unwrap());
     let status = status.to_string();
@@ -33,7 +33,7 @@ fn server(status: &str, body: Vec<u8>, delay: Duration) -> (String, thread::Join
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
         let mut request = [0; 4096];
-        let _ = stream.read(&mut request);
+        let n = stream.read(&mut request).unwrap_or(0);
         thread::sleep(delay);
         let response = format!(
             "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -41,6 +41,7 @@ fn server(status: &str, body: Vec<u8>, delay: Duration) -> (String, thread::Join
         );
         let _ = stream.write_all(response.as_bytes());
         let _ = stream.write_all(&body);
+        String::from_utf8_lossy(&request[..n]).into_owned()
     });
     (url, handle)
 }
@@ -77,6 +78,21 @@ fn remote_image_is_embedded_and_painted() {
     );
     handle.join().unwrap();
     has_painted_image(&result.unwrap().bytes);
+}
+#[test]
+fn remote_url_with_spaces_is_percent_encoded() {
+    let (url, handle) = server("200 OK", PNG.to_vec(), Duration::ZERO);
+    let result = convert(
+        &format!("<img src='{url}/logo _70 .png' style='width:64px;height:64px'>"),
+        Path::new("."),
+        &Options::default(),
+    );
+    let request = handle.join().unwrap();
+    has_painted_image(&result.unwrap().bytes);
+    assert!(
+        request.starts_with("GET /asset/logo%20_70%20.png HTTP/1.1\r\n"),
+        "{request}"
+    );
 }
 #[test]
 fn http_404_is_error() {
