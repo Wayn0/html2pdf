@@ -2,12 +2,7 @@ use crate::{MAX_ASSET_BYTES, Options, Result};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use printpdf::{Base64OrRaw, RawImage};
 use scraper::{ElementRef, Html, Selector};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs::File,
-    io::Read,
-    path::Path,
-};
+use std::{collections::BTreeMap, fs::File, io::Read, path::Path};
 
 pub(crate) struct Prepared {
     pub xml: String,
@@ -88,7 +83,11 @@ pub(crate) fn prepare(html: &str, base: &Path, options: &Options) -> Result<Prep
             );
         }
     }
-    let (css, stripped) = strip_pseudo_elements(&css);
+    let Sanitized {
+        css,
+        stripped,
+        sized_selectors,
+    } = sanitize_css(&css);
     if stripped {
         out.warnings.push(
             "CSS ::before/::after/::first-line/::first-letter rules are unsupported and were ignored"
@@ -110,7 +109,14 @@ pub(crate) fn prepare(html: &str, base: &Path, options: &Options) -> Result<Prep
             "CSS @page is unsupported; --page-size and margin options control page geometry".into(),
         );
     }
-    let mut seen = BTreeSet::new();
+    let mut images = Images {
+        sizes: BTreeMap::new(),
+        // A selector the matcher cannot parse might match an image, so it counts as one.
+        sized_by_css: sized_selectors
+            .iter()
+            .map(|s| Selector::parse(s).ok())
+            .collect(),
+    };
     for element in parsed.select(&selector("img")) {
         // Like a browser, an <img> with no source draws nothing rather than failing.
         let Some(src) = image_src(element) else {
@@ -120,12 +126,15 @@ pub(crate) fn prepare(html: &str, base: &Path, options: &Options) -> Result<Prep
             }
             continue;
         };
-        if !seen.insert(src.to_string()) {
+        if images.sizes.contains_key(src) {
             continue;
         }
         let bytes = load(src, base, options, &agent)?;
-        RawImage::decode_from_bytes(&bytes, &mut Vec::new())
+        let image = RawImage::decode_from_bytes(&bytes, &mut Vec::new())
             .map_err(|e| format!("cannot decode image {src:?} (PNG/JPEG supported): {e}"))?;
+        images
+            .sizes
+            .insert(src.to_string(), (image.width, image.height));
         out.images.insert(src.to_string(), Base64OrRaw::Raw(bytes));
     }
     out.xml.push_str("<html><head><style>");
@@ -135,12 +144,24 @@ pub(crate) fn prepare(html: &str, base: &Path, options: &Options) -> Result<Prep
         .select(&selector("body"))
         .next()
         .ok_or("HTML has no body")?;
-    serialize(body, &mut out.xml, 0)?;
+    serialize(body, &images, &mut out.xml, 0)?;
     out.xml.push_str("</html>");
     Ok(out)
 }
 
-fn serialize(element: ElementRef<'_>, out: &mut String, depth: usize) -> Result<()> {
+struct Images {
+    /// Natural pixel size of each decoded image, by `src`.
+    sizes: BTreeMap<String, (usize, usize)>,
+    /// Author rules that set a non-`auto` width or height (`None`: unparseable selector).
+    sized_by_css: Vec<Option<Selector>>,
+}
+
+fn serialize(
+    element: ElementRef<'_>,
+    images: &Images,
+    out: &mut String,
+    depth: usize,
+) -> Result<()> {
     if depth > 256 {
         return Err("HTML nesting exceeds the 256-level limit".into());
     }
@@ -164,13 +185,40 @@ fn serialize(element: ElementRef<'_>, out: &mut String, depth: usize) -> Result<
     ) {
         return Ok(());
     }
-    if name == "img" && image_src(element).is_none() {
-        return Ok(());
-    }
+    let intrinsic = if name == "img" {
+        let Some(src) = image_src(element) else {
+            return Ok(());
+        };
+        intrinsic_size(element, images.sizes.get(src).copied())
+    } else {
+        None
+    };
+    // A block-level image (Bootstrap's `img-responsive`/`center-block`) is laid out
+    // without its intrinsic size and vanishes, so also state that size as inline CSS
+    // unless an author rule or inline style sizes the image.
+    let size_style = intrinsic
+        .filter(|_| !sized_by_author(element, images))
+        .map(|(width, height)| format!("width: {width}px; height: {height}px;"));
     out.push('<');
     out.push_str(name);
+    if let Some((width, height)) = intrinsic {
+        out.push_str(&format!(" width=\"{width}\" height=\"{height}\""));
+    }
+    if let Some(size_style) = &size_style {
+        out.push_str(" style=\"");
+        out.push_str(size_style);
+        if let Some(style) = element.value().attr("style") {
+            out.push(' ');
+            escape(style, out);
+        }
+        out.push('"');
+    }
     for (key, value) in element.value().attrs() {
-        if key.starts_with("on") || key.contains(':') {
+        if key.starts_with("on")
+            || key.contains(':')
+            || (intrinsic.is_some() && matches!(key, "width" | "height"))
+            || (size_style.is_some() && key == "style")
+        {
             continue;
         }
         out.push(' ');
@@ -186,7 +234,7 @@ fn serialize(element: ElementRef<'_>, out: &mut String, depth: usize) -> Result<
     out.push('>');
     for child in element.children() {
         if let Some(e) = ElementRef::wrap(child) {
-            serialize(e, out, depth + 1)?;
+            serialize(e, images, out, depth + 1)?;
         } else if let Some(t) = child.value().as_text() {
             escape(t, out);
         }
@@ -197,12 +245,24 @@ fn serialize(element: ElementRef<'_>, out: &mut String, depth: usize) -> Result<
     Ok(())
 }
 
-/// The renderer has no pseudo-elements and would apply `.row:after { display: table }`
-/// to `.row` itself, so drop those selectors before they hide real content.
-fn strip_pseudo_elements(css: &str) -> (String, bool) {
+struct Sanitized {
+    css: String,
+    /// Whether pseudo-element selectors were dropped.
+    stripped: bool,
+    /// Selectors of rules that set a non-`auto` width or height.
+    sized_selectors: Vec<String>,
+}
+
+/// Rewrite author CSS into what the renderer handles like a browser would:
+/// - The renderer has no pseudo-elements and would apply `.row:after { display: table }`
+///   to `.row` itself, so drop those selectors before they hide real content.
+/// - A malformed declaration (e.g. a stray `class="x"` in a rule) makes the renderer
+///   lose the rest of the stylesheet, where a browser drops just that declaration.
+fn sanitize_css(css: &str) -> Sanitized {
     let css = strip_comments(css);
     let mut out = String::with_capacity(css.len());
     let mut stripped = false;
+    let mut sized_selectors = Vec::new();
     let mut rest = css.as_str();
     while let Some(open) = find_unquoted(rest, &['{', '}']) {
         let (prelude, tail) = rest.split_at(open);
@@ -224,13 +284,14 @@ fn strip_pseudo_elements(css: &str) -> (String, bool) {
             continue;
         }
         let end = block_end(tail);
-        let block = &tail[..end];
+        let raw_block = &tail[..end];
         rest = &tail[end..];
         if at_rule {
             out.push_str(selectors);
-            out.push_str(block);
+            out.push_str(raw_block);
             continue;
         }
+        let block = &clean_declarations(raw_block);
         let parts = split_selectors(selectors);
         let kept: Vec<&str> = parts
             .iter()
@@ -238,6 +299,9 @@ fn strip_pseudo_elements(css: &str) -> (String, bool) {
             .filter(|s| !is_pseudo_element(s))
             .collect();
         stripped |= kept.len() != parts.len();
+        if declares_size(block) {
+            sized_selectors.extend(kept.iter().map(|s| s.to_string()));
+        }
         if !kept.is_empty() {
             out.push('\n');
             out.push_str(&kept.join(", "));
@@ -256,7 +320,71 @@ fn strip_pseudo_elements(css: &str) -> (String, bool) {
         }
     }
     out.push_str(rest);
-    (out, stripped)
+    Sanitized {
+        css: out,
+        stripped,
+        sized_selectors,
+    }
+}
+
+/// Keep only well-formed `name: value` declarations of a `{ ... }` block.
+fn clean_declarations(block: &str) -> String {
+    let Some(inner) = block
+        .strip_prefix('{')
+        .and_then(|b| b.strip_suffix('}'))
+        .filter(|b| find_unquoted(b, &['{', '}']).is_none())
+    else {
+        return block.to_string();
+    };
+    let kept: Vec<&str> = split_unquoted(inner, ';')
+        .into_iter()
+        .map(str::trim)
+        .filter(|d| declaration(d).is_some())
+        .collect();
+    if kept.is_empty() {
+        return "{ }".into();
+    }
+    format!("{{ {}; }}", kept.join("; "))
+}
+
+/// The property name and value of a well-formed declaration.
+fn declaration(decl: &str) -> Option<(&str, &str)> {
+    let (name, value) = decl.split_once(':')?;
+    let name = name.trim();
+    let ident = name.strip_prefix('-').unwrap_or(name);
+    let valid = ident
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '-')
+        && ident
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    (valid && !value.trim().is_empty()).then_some((name, value.trim()))
+}
+
+/// Whether declarations set a `width` or `height` other than `auto`.
+fn declares_size(declarations: &str) -> bool {
+    let inner = declarations.trim();
+    let inner = inner
+        .strip_prefix('{')
+        .and_then(|b| b.strip_suffix('}'))
+        .unwrap_or(inner);
+    split_unquoted(inner, ';')
+        .into_iter()
+        .filter_map(|d| declaration(d.trim()))
+        .any(|(name, value)| {
+            let value = value.trim_end_matches("!important").trim();
+            matches!(name.to_ascii_lowercase().as_str(), "width" | "height")
+                && !value.eq_ignore_ascii_case("auto")
+        })
+}
+
+fn sized_by_author(element: ElementRef<'_>, images: &Images) -> bool {
+    element.value().attr("style").is_some_and(declares_size)
+        || images
+            .sized_by_css
+            .iter()
+            .any(|s| s.as_ref().is_none_or(|s| s.matches(&element)))
 }
 
 fn strip_comments(css: &str) -> String {
@@ -354,9 +482,13 @@ fn is_group_rule(prelude: &str) -> bool {
 }
 
 fn split_selectors(list: &str) -> Vec<&str> {
+    split_unquoted(list, ',')
+}
+
+fn split_unquoted(list: &str, separator: char) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut rest = list;
-    while let Some(i) = find_unquoted(rest, &[',']) {
+    while let Some(i) = find_unquoted(rest, &[separator]) {
         parts.push(&rest[..i]);
         rest = &rest[i + 1..];
     }
@@ -390,6 +522,40 @@ fn is_pseudo_element(selector: &str) -> bool {
         || [":before", ":after", ":first-line", ":first-letter"]
             .iter()
             .any(|p| s.contains(p))
+}
+
+/// The renderer sizes an image only from its `width`/`height` attributes and treats a
+/// missing one as zero, so fill them in like a browser: the natural pixel size, with a
+/// single stated dimension scaled by the image's aspect ratio. Non-pixel attribute
+/// values (such as percentages) are left to the renderer.
+fn intrinsic_size(
+    element: ElementRef<'_>,
+    natural: Option<(usize, usize)>,
+) -> Option<(usize, usize)> {
+    let (natural_w, natural_h) = natural.filter(|&(w, h)| w > 0 && h > 0)?;
+    let attr = |key| -> Option<Option<f64>> {
+        let Some(value) = element
+            .value()
+            .attr(key)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        else {
+            return Some(None);
+        };
+        let px = value.strip_suffix("px").unwrap_or(value).trim();
+        px.parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .map(Some)
+    };
+    let ratio = natural_h as f64 / natural_w as f64;
+    let (width, height) = match (attr("width")?, attr("height")?) {
+        (Some(w), Some(h)) => (w, h),
+        (Some(w), None) => (w, w * ratio),
+        (None, Some(h)) => (h / ratio, h),
+        (None, None) => (natural_w as f64, natural_h as f64),
+    };
+    Some((width.round() as usize, height.round() as usize))
 }
 
 fn image_src<'a>(element: ElementRef<'a>) -> Option<&'a str> {
@@ -514,7 +680,7 @@ mod tests {
     }
     #[test]
     fn pseudo_element_rules_are_stripped() {
-        let (css, stripped) = strip_pseudo_elements(
+        let Sanitized { css, stripped, .. } = sanitize_css(
             "/* a{} */ *, *:before, *::after { box-sizing: border-box; }\n\
              .row:before, .row:after { display: table; content: \" { \"; }\n\
              @media print { a[href]:after { content: \" (\" attr(href) \")\"; } p { color: red; } }\n\
@@ -529,13 +695,75 @@ mod tests {
         assert!(css.contains("@font-face { font-family: x; }"));
         assert!(css.contains(".row { margin: 0; }"));
         assert!(!css.contains("flow-root"));
-        let (css, _) = strip_pseudo_elements(
+        let css = sanitize_css(
             ".clearfix:after, .row::after { clear: both; } .x:after { content: \"\"; }",
-        );
+        )
+        .css;
         assert!(css.contains(".clearfix, .row { display: flow-root; }"));
         assert!(!css.contains(".x"));
-        let (css, stripped) = strip_pseudo_elements("p:hover { x: y }");
-        assert_eq!((css.trim(), stripped), ("p:hover { x: y }", false));
+        let Sanitized { css, stripped, .. } = sanitize_css("p:hover { x: y }");
+        assert_eq!((css.trim(), stripped), ("p:hover { x: y; }", false));
+    }
+    #[test]
+    fn malformed_declarations_are_dropped() {
+        // A stray attribute pasted into a rule must not take the rest of the stylesheet with it.
+        let Sanitized { css, .. } = sanitize_css(
+            "@media (min-width: 1px) { .a {class=\"x\"\n width: 1%; } .b { ; } }\n\
+             p { color: red;; background: url(a;b) } .c { -webkit-x: 1; --y: 2; 3d: no; }",
+        );
+        assert!(css.contains(".a { }") && css.contains(".b { }"));
+        assert!(css.contains("p { color: red; background: url(a;b); }"));
+        assert!(css.contains(".c { -webkit-x: 1; --y: 2; }"));
+        assert!(!css.contains("class") && !css.contains(";;") && !css.contains("{ ;"));
+    }
+    #[test]
+    fn image_sizes_follow_attributes_and_author_css() {
+        let sized = sanitize_css(
+            "img { max-width: 100%; height: auto !important; } .logo, p { width: 9px; }",
+        )
+        .sized_selectors;
+        assert_eq!(sized, [".logo", "p"]);
+        let html = Html::parse_fragment(
+            "<img src=a width=180px><img src=a height=50><img src=a><img src=a width=50%>\
+             <img src=a class=logo><img src=a style='height: 9px'><img src=b>",
+        );
+        let images = Images {
+            sizes: BTreeMap::from([("a".to_string(), (360, 100))]),
+            sized_by_css: sized.iter().map(|s| Selector::parse(s).ok()).collect(),
+        };
+        let found: Vec<_> = html
+            .select(&Selector::parse("img").unwrap())
+            .map(|e| {
+                let size = intrinsic_size(e, images.sizes.get(image_src(e).unwrap()).copied());
+                (size, sized_by_author(e, &images))
+            })
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (Some((180, 50)), false),
+                (Some((180, 50)), false),
+                (Some((360, 100)), false),
+                (None, false),
+                (Some((360, 100)), true),
+                (Some((360, 100)), true),
+                (None, false),
+            ]
+        );
+        let mut xml = String::new();
+        serialize(
+            html.select(&Selector::parse("img").unwrap())
+                .next()
+                .unwrap(),
+            &images,
+            &mut xml,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            xml,
+            "<img width=\"180\" height=\"50\" style=\"width: 180px; height: 50px;\" src=\"a\" />"
+        );
     }
     #[test]
     fn url_encoding() {

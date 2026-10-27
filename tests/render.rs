@@ -536,3 +536,103 @@ fn bootstrap_clearfix_keeps_content_and_contains_floats() {
         "text after the floated row overlaps the image"
     );
 }
+#[test]
+fn bootstrap_report_keeps_logos_chart_and_styles_in_place() {
+    // Sanitized from a production report converted with
+    // `--page-size Letter --zoom 1.25 -L 10mm -R 10mm`. Its stylesheet has a stray
+    // `class="..."` inside a rule, which used to discard every later rule; the logos
+    // overlapped the heading and the block-level chart was drawn over the next one.
+    let options = Options {
+        page_size: html2pdf::PageSize::Letter,
+        zoom: 1.25,
+        margins: html2pdf::Margins {
+            left: 10.,
+            right: 10.,
+            ..html2pdf::Margins::uniform(12.)
+        },
+        ..Options::default()
+    };
+    let result = convert(
+        include_str!("fixtures/bootstrap-report.html"),
+        Path::new("tests/fixtures"),
+        &options,
+    )
+    .unwrap();
+    let pdf = lopdf::Document::load_mem(&result.bytes).unwrap();
+    let all = text(&pdf);
+    for marker in [
+        "Wobbleton Snorkel Summary",
+        "Breakdown of florps",
+        "Snorkel Tally Below Chart",
+        "Day Quin 42 43 44 45 46 47",
+        "Wibble Reasons",
+        "Krandle's Nook",
+        "Tarnwhistle 5 6 7 8 9 10 11",
+        "REASONS-END",
+    ] {
+        assert!(all.contains(marker), "{marker} missing from {all:?}");
+    }
+
+    let page = *pdf.get_pages().values().next().unwrap();
+    let ops = lopdf::content::Content::decode(&pdf.get_page_content(page))
+        .unwrap()
+        .operations;
+    let num = |o: &lopdf::Object| o.as_float().unwrap();
+    // Image placements [width, height, x, y] by name, from the `cm` before each `Do`.
+    let mut images = std::collections::BTreeMap::new();
+    let mut matrix = vec![];
+    // Heading baselines: text drawn at the page's largest font size.
+    let mut headings: Vec<(f32, f32, f32)> = vec![];
+    let mut size = 0.;
+    for op in &ops {
+        match op.operator.as_str() {
+            "cm" => matrix = op.operands.iter().map(num).collect(),
+            "Do" => {
+                let name = op.operands[0].as_name().unwrap();
+                let m = &matrix;
+                images.insert(
+                    String::from_utf8_lossy(name).into_owned(),
+                    [m[0], m[3], m[4], m[5]],
+                );
+            }
+            "Tf" => size = num(&op.operands[1]),
+            "Tm" => headings.push((size, num(&op.operands[4]), num(&op.operands[5]))),
+            _ => {}
+        }
+    }
+    let largest = headings.iter().map(|h| h.0).fold(0., f32::max);
+    headings.retain(|h| h.0 == largest);
+    headings.dedup_by(|a, b| (a.2 - b.2).abs() < 1.);
+    let [title, tally] = headings[..] else {
+        panic!("expected two headings on page 1, got {headings:?}");
+    };
+
+    let image = |name: &str| images[&format!("HtmlImg_report_{name}_png")];
+    let aspect = |[w, h, ..]: [f32; 4]| w / h;
+    for (name, natural) in [("wide_logo", 1080. / 282.), ("site_logo", 350. / 150.)] {
+        let logo = image(name);
+        assert!(
+            (aspect(logo) - natural).abs() < 0.03,
+            "{name} distorted: {logo:?}"
+        );
+        assert!(
+            logo[3] > title.2 + title.0,
+            "{name} {logo:?} overlaps heading {title:?}"
+        );
+    }
+    let chart = image("chart");
+    assert!(
+        (aspect(chart) - 175. / 174.).abs() < 0.03,
+        "chart distorted: {chart:?}"
+    );
+    assert!(
+        chart[3] > tally.2 + tally.0,
+        "chart {chart:?} overlaps heading {tally:?}"
+    );
+    assert!(
+        chart[2] > 150.,
+        "center-block chart is not centered: {chart:?}"
+    );
+    // `.text-center` comes after the malformed rule, so it proves the cascade survived.
+    assert!(title.1 > 120., "heading is not centered: {title:?}");
+}

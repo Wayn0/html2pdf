@@ -160,11 +160,13 @@ tags, named entities and void elements, then normalizes it for the embedded
   complex `@media` rules.
 - Local PNG/JPEG images, absolute HTTP(S) image URLs, and base64 data images.
   Duplicate image sources are loaded once. An `<img>` with a missing or empty
-  `src` is skipped with a warning, as in a browser. Use explicit image dimensions
-  in CSS, for example `<img src="logo.png" style="width:120px;height:40px">`:
-  the renderer does not yet keep the aspect ratio when only a CSS width is set,
-  and a `display: block` image (such as Bootstrap's `center-block` or
-  `img-responsive`) without both a CSS width and height is not drawn.
+  `src` is skipped with a warning, as in a browser. Images without author CSS
+  sizing are laid out like a browser: at their natural pixel size, or scaled from
+  a single `width`/`height` attribute with the aspect ratio kept, including
+  `display: block` images such as Bootstrap's `center-block` and `img-responsive`.
+  When CSS sets only a width or only a height, the renderer does not yet keep the
+  aspect ratio; give both, for example
+  `<img src="logo.png" style="width:120px;height:40px">`.
 - Relative asset paths resolve against the HTML file's directory, independent of
   the process working directory. `--base-dir` overrides this. Local asset paths
   are filesystem paths, not URL-encoded paths; use absolute HTTP(S) URLs for remote
@@ -199,6 +201,15 @@ engine rather than implementing a new browser.
   otherwise apply them to the element itself. A clearfix rule
   (`.row::after { clear: both }`) is translated to `.row { display: flow-root }`
   so the element still contains its floats.
+- Malformed CSS declarations (for example a stray `class="x"` inside a rule) are
+  dropped individually, as a browser does; the renderer would otherwise discard
+  the rest of the stylesheet.
+- **Auto-layout tables do not wrap cell text to fit their container.** Columns get
+  their unwrapped width, so a table whose header labels are wider than the page
+  is clipped at the right edge (for example 7+ columns at `--zoom 1.25` on
+  Letter). Use shorter labels or a smaller `--zoom`.
+- Some nested Bootstrap grid layouts draw an extra empty bordered row at the end
+  of a bordered table. No content is lost.
 - Inline SVG/MathML and embedded documents/media are omitted with a warning.
   Interactive forms and canvas are unsupported. Rasterize charts into PNG/JPEG
   before conversion. Only PNG and JPEG decoders are enabled initially.
