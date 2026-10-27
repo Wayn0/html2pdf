@@ -31,3 +31,5 @@ Thumbs.db
 /.codex/
 /.aws/
 *.log
+
+bad_pdfs/

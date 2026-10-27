@@ -159,8 +159,12 @@ tags, named entities and void elements, then normalizes it for the embedded
   screen-only stylesheets are skipped. Prefer a separate print stylesheet over
   complex `@media` rules.
 - Local PNG/JPEG images, absolute HTTP(S) image URLs, and base64 data images.
-  Duplicate image sources are loaded once. Use explicit image dimensions in CSS,
-  for example `<img src="logo.png" style="width:120px;height:40px">`.
+  Duplicate image sources are loaded once. An `<img>` with a missing or empty
+  `src` is skipped with a warning, as in a browser. Use explicit image dimensions
+  in CSS, for example `<img src="logo.png" style="width:120px;height:40px">`:
+  the renderer does not yet keep the aspect ratio when only a CSS width is set,
+  and a `display: block` image (such as Bootstrap's `center-block` or
+  `img-responsive`) without both a CSS width and height is not drawn.
 - Relative asset paths resolve against the HTML file's directory, independent of
   the process working directory. `--base-dir` overrides this. Local asset paths
   are filesystem paths, not URL-encoded paths; use absolute HTTP(S) URLs for remote
@@ -190,6 +194,11 @@ engine rather than implementing a new browser.
 - CSS `@page`, CSS `url()` assets, `@font-face`, and JavaScript-generated content
   are unsupported. `@import` is rejected with an actionable error. `@media`
   blocks have limited support. Use `--font`, `<img>` and linked print CSS instead.
+- Pseudo-elements (`::before`, `::after`, `::first-line`, `::first-letter`) are
+  unsupported; their rules are dropped with a warning because the renderer would
+  otherwise apply them to the element itself. A clearfix rule
+  (`.row::after { clear: both }`) is translated to `.row { display: flow-root }`
+  so the element still contains its floats.
 - Inline SVG/MathML and embedded documents/media are omitted with a warning.
   Interactive forms and canvas are unsupported. Rasterize charts into PNG/JPEG
   before conversion. Only PNG and JPEG decoders are enabled initially.

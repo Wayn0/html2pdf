@@ -319,12 +319,6 @@ fn oversized_input_is_an_error() {
     );
 }
 #[test]
-fn empty_image_source_is_an_error() {
-    for html in ["<img>", "<img src=''>"] {
-        assert!(convert(html, Path::new("."), &Options::default()).is_err());
-    }
-}
-#[test]
 fn zero_remote_timeout_is_an_error() {
     assert!(
         convert(
@@ -509,4 +503,36 @@ fn margin_must_leave_printable_area() {
         },
     );
     assert!(result.is_err());
+}
+#[test]
+fn bootstrap_clearfix_keeps_content_and_contains_floats() {
+    // Bootstrap's clearfix used to apply `display: table` to `.row` itself and drop its content.
+    let (result, pdf) = render(
+        "<style>.row:before, .row:after { display: table; content: \" \"; }\
+         .row:after { clear: both; }</style>\
+         <div class='row'><div style='width:50%;float:left'>\
+         <img src='logo.png' style='width:180px;height:150px'></div>\
+         <div style='width:50%;float:left'><p>RIGHT-COLUMN</p></div></div>\
+         <div class='row'><p>INSIDE-ROW</p></div><h3>AFTER-FLOATS</h3>",
+    );
+    assert!(result.warnings.iter().any(|w| w.contains("::after")));
+    let all = text(&pdf);
+    for marker in ["RIGHT-COLUMN", "INSIDE-ROW", "AFTER-FLOATS"] {
+        assert!(all.contains(marker), "{marker} missing from {all:?}");
+    }
+    let page = *pdf.get_pages().values().next().unwrap();
+    let ops = lopdf::content::Content::decode(&pdf.get_page_content(page))
+        .unwrap()
+        .operations;
+    let y = |op: &lopdf::content::Operation| op.operands[5].as_float().unwrap();
+    let image_bottom = ops.iter().find(|op| op.operator == "cm").map(y).unwrap();
+    let last_text = ops
+        .iter()
+        .filter(|op| op.operator == "Tm")
+        .map(y)
+        .next_back();
+    assert!(
+        last_text.unwrap() < image_bottom,
+        "text after the floated row overlaps the image"
+    );
 }

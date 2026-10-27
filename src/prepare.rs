@@ -88,6 +88,13 @@ pub(crate) fn prepare(html: &str, base: &Path, options: &Options) -> Result<Prep
             );
         }
     }
+    let (css, stripped) = strip_pseudo_elements(&css);
+    if stripped {
+        out.warnings.push(
+            "CSS ::before/::after/::first-line/::first-letter rules are unsupported and were ignored"
+                .into(),
+        );
+    }
     if css.contains("@import") {
         return Err("CSS @import is not supported; use <link rel=\"stylesheet\"> instead".into());
     }
@@ -105,11 +112,14 @@ pub(crate) fn prepare(html: &str, base: &Path, options: &Options) -> Result<Prep
     }
     let mut seen = BTreeSet::new();
     for element in parsed.select(&selector("img")) {
-        let src = element
-            .value()
-            .attr("src")
-            .filter(|s| !s.is_empty())
-            .ok_or("image has no src")?;
+        // Like a browser, an <img> with no source draws nothing rather than failing.
+        let Some(src) = image_src(element) else {
+            if !out.warnings.iter().any(|w| w.starts_with("skipped <img>")) {
+                out.warnings
+                    .push("skipped <img> with missing or empty src".into());
+            }
+            continue;
+        };
         if !seen.insert(src.to_string()) {
             continue;
         }
@@ -154,6 +164,9 @@ fn serialize(element: ElementRef<'_>, out: &mut String, depth: usize) -> Result<
     ) {
         return Ok(());
     }
+    if name == "img" && image_src(element).is_none() {
+        return Ok(());
+    }
     out.push('<');
     out.push_str(name);
     for (key, value) in element.value().attrs() {
@@ -182,6 +195,205 @@ fn serialize(element: ElementRef<'_>, out: &mut String, depth: usize) -> Result<
     out.push_str(name);
     out.push('>');
     Ok(())
+}
+
+/// The renderer has no pseudo-elements and would apply `.row:after { display: table }`
+/// to `.row` itself, so drop those selectors before they hide real content.
+fn strip_pseudo_elements(css: &str) -> (String, bool) {
+    let css = strip_comments(css);
+    let mut out = String::with_capacity(css.len());
+    let mut stripped = false;
+    let mut rest = css.as_str();
+    while let Some(open) = find_unquoted(rest, &['{', '}']) {
+        let (prelude, tail) = rest.split_at(open);
+        if let Some(after) = tail.strip_prefix('}') {
+            out.push_str(prelude);
+            out.push('}');
+            rest = after;
+            continue;
+        }
+        // Statements such as `@charset ...;` end before the block's selector.
+        let start = prelude.rfind(';').map_or(0, |i| i + 1);
+        out.push_str(&prelude[..start]);
+        let selectors = &prelude[start..];
+        let at_rule = selectors.trim_start().starts_with('@');
+        if at_rule && is_group_rule(selectors) {
+            out.push_str(selectors);
+            out.push('{');
+            rest = &tail[1..];
+            continue;
+        }
+        let end = block_end(tail);
+        let block = &tail[..end];
+        rest = &tail[end..];
+        if at_rule {
+            out.push_str(selectors);
+            out.push_str(block);
+            continue;
+        }
+        let parts = split_selectors(selectors);
+        let kept: Vec<&str> = parts
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !is_pseudo_element(s))
+            .collect();
+        stripped |= kept.len() != parts.len();
+        if !kept.is_empty() {
+            out.push('\n');
+            out.push_str(&kept.join(", "));
+            out.push(' ');
+            out.push_str(block);
+        }
+        // A clearfix (`.row:after { clear: both }`) makes its host contain floats.
+        let hosts: Vec<&str> = parts
+            .iter()
+            .filter_map(|s| clearfix_host(s.trim(), block))
+            .collect();
+        if !hosts.is_empty() {
+            out.push('\n');
+            out.push_str(&hosts.join(", "));
+            out.push_str(" { display: flow-root; }");
+        }
+    }
+    out.push_str(rest);
+    (out, stripped)
+}
+
+fn strip_comments(css: &str) -> String {
+    let mut out = String::with_capacity(css.len());
+    let mut chars = css.chars().peekable();
+    let mut quote = None;
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                out.push(c);
+                if c == '\\' {
+                    out.extend(chars.next());
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None if c == '/' && chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut prev = ' ';
+                for c in chars.by_ref() {
+                    if prev == '*' && c == '/' {
+                        break;
+                    }
+                    prev = c;
+                }
+                out.push(' ');
+            }
+            None => {
+                if c == '"' || c == '\'' {
+                    quote = Some(c);
+                }
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
+/// Byte offset of the first of `targets` outside quotes, parentheses and brackets.
+fn find_unquoted(s: &str, targets: &[char]) -> Option<usize> {
+    let mut quote = None;
+    let mut depth = 0usize;
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+        } else if c == '"' || c == '\'' {
+            quote = Some(c);
+        } else if c == '(' || c == '[' {
+            depth += 1;
+        } else if (c == ')' || c == ']') && depth > 0 {
+            depth -= 1;
+        } else if depth == 0 && targets.contains(&c) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Length of the `{ ... }` block at the start of `s`, including any nested blocks.
+fn block_end(s: &str) -> usize {
+    let mut depth = 0usize;
+    let mut offset = 0;
+    while let Some(i) = find_unquoted(&s[offset..], &['{', '}']) {
+        offset += i;
+        if s[offset..].starts_with('{') {
+            depth += 1;
+        } else {
+            depth -= 1;
+        }
+        offset += 1;
+        if depth == 0 {
+            return offset;
+        }
+    }
+    s.len()
+}
+
+fn is_group_rule(prelude: &str) -> bool {
+    let name = prelude.trim_start()[1..]
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "media" | "supports" | "document" | "layer" | "container"
+    )
+}
+
+fn split_selectors(list: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut rest = list;
+    while let Some(i) = find_unquoted(rest, &[',']) {
+        parts.push(&rest[..i]);
+        rest = &rest[i + 1..];
+    }
+    parts.push(rest);
+    parts
+}
+
+fn clearfix_host<'a>(selector: &'a str, block: &str) -> Option<&'a str> {
+    let block = block.to_ascii_lowercase().replace(char::is_whitespace, "");
+    if !["clear:both", "clear:left", "clear:right"]
+        .iter()
+        .any(|c| block.contains(c))
+    {
+        return None;
+    }
+    let lower = selector.to_ascii_lowercase();
+    let host = if lower.ends_with("::after") {
+        &selector[..selector.len() - 7]
+    } else if lower.ends_with(":after") {
+        &selector[..selector.len() - 6]
+    } else {
+        return None;
+    };
+    (!host.is_empty() && !is_pseudo_element(host) && !host.ends_with(char::is_whitespace))
+        .then_some(host)
+}
+
+fn is_pseudo_element(selector: &str) -> bool {
+    let s = selector.to_ascii_lowercase();
+    s.contains("::")
+        || [":before", ":after", ":first-line", ":first-letter"]
+            .iter()
+            .any(|p| s.contains(p))
+}
+
+fn image_src<'a>(element: ElementRef<'a>) -> Option<&'a str> {
+    element.value().attr("src").filter(|s| !s.trim().is_empty())
 }
 
 fn escape(s: &str, out: &mut String) {
@@ -299,6 +511,31 @@ mod tests {
         assert!(!p.xml.contains("script"));
         assert!(!p.xml.contains("onclick"));
         assert_eq!(p.warnings.len(), 1);
+    }
+    #[test]
+    fn pseudo_element_rules_are_stripped() {
+        let (css, stripped) = strip_pseudo_elements(
+            "/* a{} */ *, *:before, *::after { box-sizing: border-box; }\n\
+             .row:before, .row:after { display: table; content: \" { \"; }\n\
+             @media print { a[href]:after { content: \" (\" attr(href) \")\"; } p { color: red; } }\n\
+             a[href^=\"javascript:\"], :not(.a, .b) { color: blue; }\n\
+             @font-face { font-family: x; } .row { margin: 0; }",
+        );
+        assert!(stripped);
+        assert!(!css.contains("before") && !css.contains("after") && !css.contains("table"));
+        assert!(css.contains("* { box-sizing: border-box; }"));
+        assert!(css.contains("@media print {\np { color: red; } }"));
+        assert!(css.contains("a[href^=\"javascript:\"], :not(.a, .b) { color: blue; }"));
+        assert!(css.contains("@font-face { font-family: x; }"));
+        assert!(css.contains(".row { margin: 0; }"));
+        assert!(!css.contains("flow-root"));
+        let (css, _) = strip_pseudo_elements(
+            ".clearfix:after, .row::after { clear: both; } .x:after { content: \"\"; }",
+        );
+        assert!(css.contains(".clearfix, .row { display: flow-root; }"));
+        assert!(!css.contains(".x"));
+        let (css, stripped) = strip_pseudo_elements("p:hover { x: y }");
+        assert_eq!((css.trim(), stripped), ("p:hover { x: y }", false));
     }
     #[test]
     fn url_encoding() {

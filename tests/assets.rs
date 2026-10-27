@@ -184,3 +184,23 @@ fn repeated_image_source_only_embeds_once() {
         .count();
     assert_eq!(count, 1);
 }
+#[test]
+fn image_without_src_is_skipped_with_warning() {
+    let c = convert(
+        "<p>Before</p><img><img src=''><img src='  ' alt='chart'>\
+         <img src='logo.png' style='width:64px;height:64px'><p>After end marker</p>",
+        Path::new("tests/fixtures"),
+        &Options::default(),
+    )
+    .unwrap();
+    has_painted_image(&c.bytes);
+    assert!(
+        c.warnings
+            .iter()
+            .any(|w| w.contains("missing or empty src"))
+    );
+    let doc = lopdf::Document::load_mem(&c.bytes).unwrap();
+    let text = doc.extract_text(&[1]).unwrap();
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(text.contains("Before") && text.contains("After end marker"));
+}
