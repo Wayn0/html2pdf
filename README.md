@@ -204,12 +204,28 @@ engine rather than implementing a new browser.
 - Malformed CSS declarations (for example a stray `class="x"` inside a rule) are
   dropped individually, as a browser does; the renderer would otherwise discard
   the rest of the stylesheet.
-- **Auto-layout tables do not wrap cell text to fit their container.** Columns get
-  their unwrapped width, so a table whose header labels are wider than the page
-  is clipped at the right edge (for example 7+ columns at `--zoom 1.25` on
-  Letter). Use shorter labels or a smaller `--zoom`.
-- Some nested Bootstrap grid layouts draw an extra empty bordered row at the end
-  of a bordered table. No content is lost.
+- The renderer rejects declarations marked `!important` (such as Bootstrap's
+  `.pull-right { float: right !important }`). The marker is removed and top-level
+  important declarations are repeated at the end of the stylesheet, so they still
+  beat later rules of equal specificity. They do not beat more specific selectors
+  as they would in a browser.
+- **Table column widths are estimated.** The renderer's automatic table layout
+  never wraps cell text: Azul measures each cell's min-content width at an
+  effectively unlimited width, so wide tables used to run past the right margin.
+  For a table with an author width (CSS, inline style or `width` attribute) and no
+  `colspan`/`rowspan`, html2pdf estimates column widths from the cell text with the
+  CSS auto-layout rules and switches the table to `table-layout: fixed`, which does
+  wrap. The estimate assumes Helvetica-like glyph widths, so columns can differ
+  from a browser's. When even fully wrapped columns cannot fit, they shrink below
+  their longest word and the renderer breaks words such as dates at hyphens.
+  Tables without an author width, or with spanning cells, keep the clipping
+  behaviour.
+- **Tables inside floated Bootstrap grid columns paginate badly.** After a page
+  break, cell borders can be drawn offset from the text, with extra empty rows at
+  the end of the table (even without a page break, one extra empty row is common).
+  No content is lost. `page-break-inside: avoid` is not honoured. Keep tables
+  outside floated columns and start a page with `page-break-before: always`
+  instead.
 - Inline SVG/MathML and embedded documents/media are omitted with a warning.
   Interactive forms and canvas are unsupported. Rasterize charts into PNG/JPEG
   before conversion. Only PNG and JPEG decoders are enabled initially.

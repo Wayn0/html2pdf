@@ -109,14 +109,20 @@ pub(crate) fn prepare(html: &str, base: &Path, options: &Options) -> Result<Prep
             "CSS @page is unsupported; --page-size and margin options control page geometry".into(),
         );
     }
-    let mut images = Images {
+    let mut hints = Hints {
         sizes: BTreeMap::new(),
         // A selector the matcher cannot parse might match an image, so it counts as one.
         sized_by_css: sized_selectors
             .iter()
             .map(|s| Selector::parse(s).ok())
             .collect(),
+        styles: Vec::new(),
     };
+    for table in parsed.select(&selector("table")) {
+        if let Some(styles) = fixed_table_layout(table, &hints, options) {
+            hints.styles.extend(styles);
+        }
+    }
     for element in parsed.select(&selector("img")) {
         // Like a browser, an <img> with no source draws nothing rather than failing.
         let Some(src) = image_src(element) else {
@@ -126,13 +132,13 @@ pub(crate) fn prepare(html: &str, base: &Path, options: &Options) -> Result<Prep
             }
             continue;
         };
-        if images.sizes.contains_key(src) {
+        if hints.sizes.contains_key(src) {
             continue;
         }
         let bytes = load(src, base, options, &agent)?;
         let image = RawImage::decode_from_bytes(&bytes, &mut Vec::new())
             .map_err(|e| format!("cannot decode image {src:?} (PNG/JPEG supported): {e}"))?;
-        images
+        hints
             .sizes
             .insert(src.to_string(), (image.width, image.height));
         out.images.insert(src.to_string(), Base64OrRaw::Raw(bytes));
@@ -144,21 +150,23 @@ pub(crate) fn prepare(html: &str, base: &Path, options: &Options) -> Result<Prep
         .select(&selector("body"))
         .next()
         .ok_or("HTML has no body")?;
-    serialize(body, &images, &mut out.xml, 0)?;
+    serialize(body, &hints, &mut out.xml, 0)?;
     out.xml.push_str("</html>");
     Ok(out)
 }
 
-struct Images {
+struct Hints<'a> {
     /// Natural pixel size of each decoded image, by `src`.
     sizes: BTreeMap<String, (usize, usize)>,
     /// Author rules that set a non-`auto` width or height (`None`: unparseable selector).
     sized_by_css: Vec<Option<Selector>>,
+    /// Inline CSS to put before an element's own style, such as fixed table widths.
+    styles: Vec<(ElementRef<'a>, String)>,
 }
 
 fn serialize(
     element: ElementRef<'_>,
-    images: &Images,
+    hints: &Hints<'_>,
     out: &mut String,
     depth: usize,
 ) -> Result<()> {
@@ -189,27 +197,34 @@ fn serialize(
         let Some(src) = image_src(element) else {
             return Ok(());
         };
-        intrinsic_size(element, images.sizes.get(src).copied())
+        intrinsic_size(element, hints.sizes.get(src).copied())
     } else {
         None
     };
     // A block-level image (Bootstrap's `img-responsive`/`center-block`) is laid out
     // without its intrinsic size and vanishes, so also state that size as inline CSS
     // unless an author rule or inline style sizes the image.
-    let size_style = intrinsic
-        .filter(|_| !sized_by_author(element, images))
-        .map(|(width, height)| format!("width: {width}px; height: {height}px;"));
+    let extra_style = intrinsic
+        .filter(|_| !sized_by_author(element, hints))
+        .map(|(width, height)| format!("width: {width}px; height: {height}px;"))
+        .or_else(|| {
+            hints
+                .styles
+                .iter()
+                .find(|(e, _)| *e == element)
+                .map(|(_, style)| style.clone())
+        });
     out.push('<');
     out.push_str(name);
     if let Some((width, height)) = intrinsic {
         out.push_str(&format!(" width=\"{width}\" height=\"{height}\""));
     }
-    if let Some(size_style) = &size_style {
+    if let Some(extra_style) = &extra_style {
         out.push_str(" style=\"");
-        out.push_str(size_style);
+        out.push_str(extra_style);
         if let Some(style) = element.value().attr("style") {
             out.push(' ');
-            escape(style, out);
+            escape(&clean_style(style).0.join("; "), out);
         }
         out.push('"');
     }
@@ -217,14 +232,18 @@ fn serialize(
         if key.starts_with("on")
             || key.contains(':')
             || (intrinsic.is_some() && matches!(key, "width" | "height"))
-            || (size_style.is_some() && key == "style")
+            || (extra_style.is_some() && key == "style")
         {
             continue;
         }
         out.push(' ');
         out.push_str(key);
         out.push_str("=\"");
-        escape(value, out);
+        if key == "style" {
+            escape(&clean_style(value).0.join("; "), out);
+        } else {
+            escape(value, out);
+        }
         out.push('"');
     }
     if element.children().next().is_none() {
@@ -234,7 +253,7 @@ fn serialize(
     out.push('>');
     for child in element.children() {
         if let Some(e) = ElementRef::wrap(child) {
-            serialize(e, images, out, depth + 1)?;
+            serialize(e, hints, out, depth + 1)?;
         } else if let Some(t) = child.value().as_text() {
             escape(t, out);
         }
@@ -258,17 +277,23 @@ struct Sanitized {
 ///   to `.row` itself, so drop those selectors before they hide real content.
 /// - A malformed declaration (e.g. a stray `class="x"` in a rule) makes the renderer
 ///   lose the rest of the stylesheet, where a browser drops just that declaration.
+/// - The renderer rejects any value marked `!important` (Bootstrap's `.pull-right`),
+///   so drop the marker. Top-level important declarations are repeated at the end of
+///   the stylesheet to keep beating later rules of equal specificity.
 fn sanitize_css(css: &str) -> Sanitized {
     let css = strip_comments(css);
     let mut out = String::with_capacity(css.len());
+    let mut important = String::new();
     let mut stripped = false;
     let mut sized_selectors = Vec::new();
+    let mut group_depth = 0usize;
     let mut rest = css.as_str();
     while let Some(open) = find_unquoted(rest, &['{', '}']) {
         let (prelude, tail) = rest.split_at(open);
         if let Some(after) = tail.strip_prefix('}') {
             out.push_str(prelude);
             out.push('}');
+            group_depth = group_depth.saturating_sub(1);
             rest = after;
             continue;
         }
@@ -280,6 +305,7 @@ fn sanitize_css(css: &str) -> Sanitized {
         if at_rule && is_group_rule(selectors) {
             out.push_str(selectors);
             out.push('{');
+            group_depth += 1;
             rest = &tail[1..];
             continue;
         }
@@ -291,7 +317,8 @@ fn sanitize_css(css: &str) -> Sanitized {
             out.push_str(raw_block);
             continue;
         }
-        let block = &clean_declarations(raw_block);
+        let (block, important_block) = clean_declarations(raw_block);
+        let block = &block;
         let parts = split_selectors(selectors);
         let kept: Vec<&str> = parts
             .iter()
@@ -307,6 +334,12 @@ fn sanitize_css(css: &str) -> Sanitized {
             out.push_str(&kept.join(", "));
             out.push(' ');
             out.push_str(block);
+            if let Some(important_block) = important_block.filter(|_| group_depth == 0) {
+                important.push('\n');
+                important.push_str(&kept.join(", "));
+                important.push(' ');
+                important.push_str(&important_block);
+            }
         }
         // A clearfix (`.row:after { clear: both }`) makes its host contain floats.
         let hosts: Vec<&str> = parts
@@ -320,6 +353,7 @@ fn sanitize_css(css: &str) -> Sanitized {
         }
     }
     out.push_str(rest);
+    out.push_str(&important);
     Sanitized {
         css: out,
         stripped,
@@ -327,24 +361,52 @@ fn sanitize_css(css: &str) -> Sanitized {
     }
 }
 
-/// Keep only well-formed `name: value` declarations of a `{ ... }` block.
-fn clean_declarations(block: &str) -> String {
+/// Keep only well-formed `name: value` declarations of a `{ ... }` block, without
+/// `!important` markers. Also returns a block of just the important declarations.
+fn clean_declarations(block: &str) -> (String, Option<String>) {
     let Some(inner) = block
         .strip_prefix('{')
         .and_then(|b| b.strip_suffix('}'))
         .filter(|b| find_unquoted(b, &['{', '}']).is_none())
     else {
-        return block.to_string();
+        return (block.to_string(), None);
     };
-    let kept: Vec<&str> = split_unquoted(inner, ';')
-        .into_iter()
-        .map(str::trim)
-        .filter(|d| declaration(d).is_some())
-        .collect();
+    let (kept, important) = clean_style(inner);
+    let wrap = |decls: Vec<String>| format!("{{ {}; }}", decls.join("; "));
     if kept.is_empty() {
-        return "{ }".into();
+        return ("{ }".into(), None);
     }
-    format!("{{ {}; }}", kept.join("; "))
+    (wrap(kept), (!important.is_empty()).then(|| wrap(important)))
+}
+
+/// Well-formed declarations of a declaration list with `!important` dropped, and
+/// the subset that carried it.
+fn clean_style(list: &str) -> (Vec<String>, Vec<String>) {
+    let mut kept = Vec::new();
+    let mut important = Vec::new();
+    for (name, value) in split_unquoted(list, ';')
+        .into_iter()
+        .filter_map(|d| declaration(d.trim()))
+    {
+        let (value, is_important) = strip_important(value);
+        let decl = format!("{name}: {value}");
+        if is_important {
+            important.push(decl.clone());
+        }
+        kept.push(decl);
+    }
+    (kept, important)
+}
+
+/// A declaration value without a trailing `!important`, and whether it had one.
+fn strip_important(value: &str) -> (&str, bool) {
+    if let Some(bang) = value.rfind('!') {
+        let marker = value[bang + 1..].trim();
+        if marker.eq_ignore_ascii_case("important") && find_unquoted(value, &['!']) == Some(bang) {
+            return (value[..bang].trim_end(), true);
+        }
+    }
+    (value, false)
 }
 
 /// The property name and value of a well-formed declaration.
@@ -373,18 +435,115 @@ fn declares_size(declarations: &str) -> bool {
         .into_iter()
         .filter_map(|d| declaration(d.trim()))
         .any(|(name, value)| {
-            let value = value.trim_end_matches("!important").trim();
+            let value = strip_important(value).0;
             matches!(name.to_ascii_lowercase().as_str(), "width" | "height")
                 && !value.eq_ignore_ascii_case("auto")
         })
 }
 
-fn sized_by_author(element: ElementRef<'_>, images: &Images) -> bool {
+fn sized_by_author(element: ElementRef<'_>, hints: &Hints<'_>) -> bool {
     element.value().attr("style").is_some_and(declares_size)
-        || images
+        || hints
             .sized_by_css
             .iter()
             .any(|s| s.as_ref().is_none_or(|s| s.matches(&element)))
+}
+
+/// Font size, in CSS px, that text width estimates assume (the default body size).
+const ESTIMATE_FONT_PX: f32 = 12.0;
+/// Estimated cell padding and borders, in em.
+const ESTIMATE_CELL_EXTRA_EM: f32 = 1.0;
+
+/// The renderer measures an auto-layout table cell's min-content width without
+/// wrapping, so a table wider than the page is clipped instead of wrapping its cells.
+/// Its fixed layout does wrap, so for a table with an author width, estimate column
+/// widths with the CSS 2.1 auto-layout rules and pin them as fixed-layout percentages
+/// on the first row. Tables with spanning cells are left to the renderer.
+fn fixed_table_layout<'a>(
+    table: ElementRef<'a>,
+    hints: &Hints<'_>,
+    options: &Options,
+) -> Option<Vec<(ElementRef<'a>, String)>> {
+    let style = table.value().attr("style").unwrap_or("");
+    if style.to_ascii_lowercase().contains("table-layout")
+        || !(table.value().attr("width").is_some() || sized_by_author(table, hints))
+    {
+        return None;
+    }
+    let children = |e: ElementRef<'a>, names: &'static [&str]| {
+        e.children()
+            .filter_map(ElementRef::wrap)
+            .filter(move |c| names.contains(&c.value().name()))
+    };
+    let rows: Vec<Vec<ElementRef<'a>>> = children(table, &["tr", "thead", "tbody", "tfoot"])
+        .flat_map(|e| match e.value().name() {
+            "tr" => vec![e],
+            _ => children(e, &["tr"]).collect(),
+        })
+        .map(|row| children(row, &["td", "th"]).collect())
+        .collect();
+    let columns = rows.first()?.len();
+    let spans = |cell: &ElementRef<'_>| {
+        ["colspan", "rowspan"]
+            .iter()
+            .any(|a| cell.value().attr(a).is_some_and(|v| v.trim() != "1"))
+    };
+    if columns < 2 || rows.iter().flatten().any(spans) || rows.iter().any(|r| r.len() > columns) {
+        return None;
+    }
+    let mut min = vec![ESTIMATE_CELL_EXTRA_EM; columns];
+    let mut max = min.clone();
+    for row in &rows {
+        for (i, cell) in row.iter().enumerate() {
+            let scale = if cell.value().name() == "th" {
+                1.1
+            } else {
+                1.0
+            };
+            let text: String = cell.text().collect();
+            let words: Vec<f32> = text.split_whitespace().map(text_width_em).collect();
+            let longest = words.iter().copied().fold(0., f32::max);
+            let line = words.iter().sum::<f32>() + text_width_em(" ") * words.len() as f32;
+            min[i] = min[i].max(longest * scale + ESTIMATE_CELL_EXTRA_EM);
+            max[i] = max[i].max(line * scale + ESTIMATE_CELL_EXTRA_EM);
+        }
+    }
+    let (page_width, _) = options.page_size.dimensions_mm();
+    let content_mm = page_width - options.margins.left - options.margins.right;
+    let available = content_mm / 25.4 * 96. / options.zoom / ESTIMATE_FONT_PX;
+    let (min_total, max_total) = (min.iter().sum::<f32>(), max.iter().sum::<f32>());
+    let widths: Vec<f32> = if max_total <= available {
+        max
+    } else if min_total >= available {
+        min
+    } else {
+        let scale = (available - min_total) / (max_total - min_total);
+        min.iter()
+            .zip(&max)
+            .map(|(lo, hi)| lo + (hi - lo) * scale)
+            .collect()
+    };
+    let total: f32 = widths.iter().sum();
+    let mut styles = vec![(table, "table-layout: fixed;".to_string())];
+    for (cell, width) in rows[0].iter().zip(widths) {
+        styles.push((*cell, format!("width: {:.2}%;", width / total * 100.)));
+    }
+    Some(styles)
+}
+
+/// Approximate width of `text` in em, from Helvetica's glyph widths.
+fn text_width_em(text: &str) -> f32 {
+    text.chars()
+        .map(|c| match c {
+            ' ' | 'i' | 'j' | 'l' | 'I' | '.' | ',' | ':' | ';' | '!' | '|' | '\'' => 0.28,
+            'f' | 't' | 'r' | '(' | ')' | '-' => 0.33,
+            'm' | 'w' | 'M' | 'W' => 0.85,
+            '0'..='9' => 0.56,
+            'A'..='Z' => 0.68,
+            'a'..='z' => 0.54,
+            _ => 0.6,
+        })
+        .sum()
 }
 
 fn strip_comments(css: &str) -> String {
@@ -717,6 +876,54 @@ mod tests {
         assert!(!css.contains("class") && !css.contains(";;") && !css.contains("{ ;"));
     }
     #[test]
+    fn important_markers_are_dropped_and_top_level_ones_repeated_last() {
+        // The renderer discards a whole declaration marked `!important`.
+        let Sanitized { css, .. } = sanitize_css(
+            ".pull-right { float: right !important; color: red }\n\
+             @media print { * { color: #000 ! IMPORTANT; } }\n\
+             .x { content: \"a !important\"; }",
+        );
+        assert!(!css.to_ascii_lowercase().contains("! important"));
+        assert!(css.contains(".pull-right { float: right; color: red; }"));
+        assert!(css.contains("@media print {\n* { color: #000; }"));
+        assert!(css.contains(".x { content: \"a !important\"; }"));
+        let tail = css.rsplit('}').nth(1).unwrap();
+        assert!(tail.ends_with(".pull-right { float: right; "), "{css}");
+        assert_eq!(css.matches("color: #000").count(), 1);
+
+        let html = "<div style=\"float: left !important; width: 1px\">x</div>";
+        let p = prepare(html, Path::new("."), &Options::default()).unwrap();
+        assert!(
+            p.xml.contains("style=\"float: left; width: 1px\""),
+            "{}",
+            p.xml
+        );
+    }
+    #[test]
+    fn sized_tables_get_fixed_layout_with_estimated_column_widths() {
+        let html = "<style>.t { width: 100% }</style>\
+            <table class=t><thead><tr><th>Name</th><th style='color: red'>Access Approved</th></tr>\
+            </thead><tr><td>A much longer first column value</td><td>0</td></tr></table>\
+            <table class=t><tr><td colspan=2>span</td></tr><tr><td>a</td><td>b</td></tr></table>\
+            <table><tr><td>auto</td><td>width</td></tr></table>";
+        let xml = prepare(html, Path::new("."), &Options::default())
+            .unwrap()
+            .xml;
+        assert_eq!(xml.matches("table-layout: fixed;").count(), 1, "{xml}");
+        let widths: Vec<f32> = xml
+            .split("<th style=\"width: ")
+            .skip(1)
+            .map(|s| s.split('%').next().unwrap().parse().unwrap())
+            .collect();
+        let [first, second] = widths[..] else {
+            panic!("expected two first-row widths in {xml}");
+        };
+        assert!((first + second - 100.).abs() < 0.1, "{widths:?}");
+        assert!(first > second, "longer content should get the wider column");
+        // The author's own inline style follows, so it still wins.
+        assert!(xml.contains("%; color: red\">Access Approved"), "{xml}");
+    }
+    #[test]
     fn image_sizes_follow_attributes_and_author_css() {
         let sized = sanitize_css(
             "img { max-width: 100%; height: auto !important; } .logo, p { width: 9px; }",
@@ -727,15 +934,16 @@ mod tests {
             "<img src=a width=180px><img src=a height=50><img src=a><img src=a width=50%>\
              <img src=a class=logo><img src=a style='height: 9px'><img src=b>",
         );
-        let images = Images {
+        let hints = Hints {
             sizes: BTreeMap::from([("a".to_string(), (360, 100))]),
             sized_by_css: sized.iter().map(|s| Selector::parse(s).ok()).collect(),
+            styles: Vec::new(),
         };
         let found: Vec<_> = html
             .select(&Selector::parse("img").unwrap())
             .map(|e| {
-                let size = intrinsic_size(e, images.sizes.get(image_src(e).unwrap()).copied());
-                (size, sized_by_author(e, &images))
+                let size = intrinsic_size(e, hints.sizes.get(image_src(e).unwrap()).copied());
+                (size, sized_by_author(e, &hints))
             })
             .collect();
         assert_eq!(
@@ -755,7 +963,7 @@ mod tests {
             html.select(&Selector::parse("img").unwrap())
                 .next()
                 .unwrap(),
-            &images,
+            &hints,
             &mut xml,
             0,
         )

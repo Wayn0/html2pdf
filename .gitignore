@@ -33,3 +33,6 @@ Thumbs.db
 *.log
 
 bad_pdfs/
+
+# Local report templates.
+ejs/

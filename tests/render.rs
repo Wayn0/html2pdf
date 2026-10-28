@@ -620,6 +620,16 @@ fn bootstrap_report_keeps_logos_chart_and_styles_in_place() {
             "{name} {logo:?} overlaps heading {title:?}"
         );
     }
+    // `.pull-left`/`.pull-right` are `!important`, which the renderer used to discard,
+    // leaving the site logo at the left edge of its half of the page.
+    let [wide, site] = [image("wide_logo"), image("site_logo")];
+    assert!(wide[2] < 60., "wide logo is not at the left: {wide:?}");
+    // Placements are in unzoomed units; an outer transform applies `--zoom 1.25`.
+    let right_margin = (612. - 10. * 72. / 25.4) / 1.25;
+    assert!(
+        (site[2] + site[0] - right_margin).abs() < 15.,
+        "site logo does not float right: {site:?}"
+    );
     let chart = image("chart");
     assert!(
         (aspect(chart) - 175. / 174.).abs() < 0.03,
@@ -635,4 +645,64 @@ fn bootstrap_report_keeps_logos_chart_and_styles_in_place() {
     );
     // `.text-center` comes after the malformed rule, so it proves the cascade survived.
     assert!(title.1 > 120., "heading is not centered: {title:?}");
+}
+#[test]
+fn wide_sized_tables_wrap_inside_the_page() {
+    // Production reports use `--page-size Letter --zoom 1.25 -L 10mm -R 10mm`; their
+    // 7- and 8-column tables ran past the right margin because the renderer never
+    // wraps auto-layout cells. The first-row labels here are wider than the page.
+    let options = Options {
+        page_size: html2pdf::PageSize::Letter,
+        zoom: 1.25,
+        margins: html2pdf::Margins {
+            left: 10.,
+            right: 10.,
+            ..html2pdf::Margins::uniform(12.)
+        },
+        ..Options::default()
+    };
+    let header: String = (1..=8)
+        .map(|i| format!("<th>Quorp Wibble Total {i}</th>"))
+        .collect();
+    let row = |label: &str| -> String {
+        let cells: String = (1..=7).map(|i| format!("<td>{i}</td>")).collect();
+        format!("<tr><td>{label}</td>{cells}</tr>")
+    };
+    let rows: String = ["Florp Glim", "Snargle Wex", "TABLE-END"].map(row).concat();
+    let html = format!(
+        "<style>body {{ margin-left: 20px }} table {{ width: 100%; border-collapse: collapse }}\
+         th, td {{ border: 1px solid #ddd; padding: 4px; font-size: 10px }}</style>\
+         <table><thead><tr>{header}</tr></thead><tbody>{rows}</tbody></table><p>AFTER-TABLE</p>"
+    );
+    let result = convert(&html, Path::new("tests/fixtures"), &options).unwrap();
+    let pdf = lopdf::Document::load_mem(&result.bytes).unwrap();
+    assert_eq!(result.pages, 1);
+    let all = text(&pdf).replace(' ', "");
+    for marker in ["Total8", "TABLE-END1234567", "AFTER-TABLE"] {
+        assert!(all.contains(marker), "{marker} missing from {all:?}");
+    }
+
+    let num = |o: &lopdf::Object| o.as_float().unwrap();
+    // Placements are in unzoomed units; an outer transform applies `--zoom 1.25`.
+    let right_margin = (612. - 10. * 72. / 25.4) / 1.25;
+    let page = *pdf.get_pages().values().next().unwrap();
+    let ops = lopdf::content::Content::decode(&pdf.get_page_content(page))
+        .unwrap()
+        .operations;
+    // Table borders are filled paths; their right edge must stay inside the margin.
+    let border_right = ops
+        .iter()
+        .filter(|op| op.operator == "l")
+        .map(|op| num(&op.operands[0]))
+        .fold(0., f32::max);
+    assert!(
+        border_right > right_margin - 20. && border_right <= right_margin + 0.5,
+        "table right edge {border_right} vs margin {right_margin}"
+    );
+    let text_right = ops
+        .iter()
+        .filter(|op| op.operator == "Tm")
+        .map(|op| num(&op.operands[4]))
+        .fold(0., f32::max);
+    assert!(text_right < border_right, "text starts past the table edge");
 }

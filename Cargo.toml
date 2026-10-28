@@ -1,6 +1,6 @@
 [package]
 name = "html2pdf"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 rust-version = "1.88"
 description = "A browser-free HTML report to PDF command-line tool"
